@@ -1,0 +1,896 @@
+//   SMART IV DRIP MONITOR  -  predictive nurse-priority system  (Arduino MEGA 2560 / Wokwi)
+//
+//   3 beds. Every bed has its OWN two dials:
+//                   FLOW dial (0..12 mL/min)     ALERT dial (2..50 % of bag left)
+//        bed 1      Pot A  -> A0                 Pot D -> A3
+//        bed 2      Pot B  -> A1                 Pot E -> A4
+//        bed 3      Pot C  -> A2                 Pot F -> A5
+//     Software  = simulates the bag draining (bag = 500 mL, time can be sped up)
+//     Prediction = time left = volume / flow -> ranks beds, nurse sees who to visit first
+//
+//   BAG SIZE (per bed): one extra SIZE button per bed (pins 22 / 23 / 24) cycles the bag
+//     volume 250 mL -> 500 mL -> 1000 mL (1 L) -> 250 mL ... The LCD shows the choice.
+//     Before START the bed uses the selected size at once. On a bed that is already running
+//     the selection is the NEXT bag: it is applied when you press START (new bag).
+//
+//   HOW TO START A BED (no timer, nothing starts by itself)
+//     1. Turn the bed's ALERT dial up from fully left -> its alert percentage is set
+//     2. Turn the bed's FLOW dial up from fully left  -> bag is hung, bed shows WAIT
+//     3. Press the bed's button                       -> monitoring starts, the current
+//                                                        flow is recorded as prescribed rate
+//     Until a bed is started it has no alarms and is ignored by the priority engine.
+//     The ALERT dial stays live: turn it any time to change that bed's percentage.
+//
+//   Alerts per bed (only for started beds)
+//     LEVL  (WARN)  : bag volume <= alert % + 3 %   -> PRE-BEEP (1 beep / s)
+//     LEVL  (CRIT)  : bag volume <= alert %         -> siren
+//     PLAN  (EARLY) : bag empties in <= 20 min      -> plan a bag change
+//     LOW   (WARN)  : <= 10 min
+//     SOON  (CRIT)  : <= 3 min
+//     EMPT  (CRIT)  : bag empty (air-in-line risk)
+//     BLCK  (CRIT)  : flow < 15 % of prescribed     -> blocked / kinked line
+//     HIGH  (WARN/CRIT): flow > 130 % / 170 % of prescribed -> clamp slipped
+//     SLOW  (WARN)  : flow < 60 % of prescribed
+//     FALT  (WARN)  : sensor fault (flow dial fully RIGHT = sensor saturated)
+//
+//   Buttons
+//     SIZE button (22/23/24) : choose the bag volume 250 / 500 / 1000 mL for that bed
+//     short press bed button : START / NEW BAG - refills that bed to the chosen size and records
+//                              the current flow as its prescribed rate
+//     long press (1.5 s)     : ACKNOWLEDGE - silences the buzzer
+//     hold all 3 (2 s)       : RESET - monitoring stops on all beds, log cleared
+//     Serial monitor: h history | a ack | r reset | t time speed (x1/x60/x240)
+//                     d demo volumes (all started beds full) | p power cut | ? help
+//
+//   LEDs: green steady = OK | green slow blink = bag hung, waiting for START |
+//         green+red = PLAN | red blink = WARN | red strobe = CRIT | off = no bag
+//
+//   Response servo points at the bed to visit first (bed1 40, bed2 90, bed3 140 deg)
+//   while that bed is WARN or CRIT, parks at 0 otherwise.
+//
+//   BAG DETECTION: flow dial fully LEFT (reading < 20) = NO IV BAG on that bed.
+//
+//   OTHER FEATURES
+//     1. ALARM ESCALATION : a CRITICAL alarm left unacknowledged for ESC_MS becomes a
+//        faster, higher siren + faster strobe + "ESCALATED" banner.
+//     2. MOVEMENT FILTER  : a flow deviation must persist 2.5-4 s before it is an alarm.
+//        While pending the bed shows "MOV?". Short changes count as patient movement.
+//     3. POWER-CUT MEMORY : bag volumes, prescriptions and started beds are saved in EEPROM
+//        (8 rotating slots with checksum). Serial 'p' simulates a power cut.
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+#include <EEPROM.h>
+#include <avr/wdt.h>
+
+// Clear the watchdog right after any reset (needed by the 'p' power-cut simulation)
+void wdtEarlyDisable(void) __attribute__((naked)) __attribute__((section(".init3"))) __attribute__((used));
+void wdtEarlyDisable(void) { MCUSR = 0; wdt_disable(); }
+
+// ===================== PIN MAP =====================
+const uint8_t PIN_FLOW[3]  = {A0, A1, A2};    // flow dial of bed 1/2/3
+const uint8_t PIN_ALERT[3] = {A3, A4, A5};    // alert-percentage dial of bed 1/2/3
+const uint8_t PIN_BTN[3]   = {2, 3, 4};
+const uint8_t PIN_SIZE[3]  = {22, 23, 24};   // bag-size select button of bed 1/2/3
+const uint8_t PIN_LED_G[3] = {5, 7, 12};
+const uint8_t PIN_LED_R[3] = {6, 8, 13};
+const uint8_t PIN_BUZZER   = 10;
+const uint8_t PIN_SERVO    = 11;
+// LCD (I2C): SDA = pin 20, SCL = pin 21 on the Mega
+
+// ===================== TUNING =====================
+const int      RAW_MIN = 20, RAW_MAX = 1003;      // < RAW_MIN = nothing set, > RAW_MAX = sensor fault
+const float    FLOW_MAX = 12.0f;                  // mL/min at full dial
+const float    BAG_SIZES[3] = {250.0f, 500.0f, 1000.0f};   // selectable bag volumes (mL)
+const uint8_t  DEFAULT_SIZE_IDX = 1;                       // 500 mL
+const uint8_t  FAULT_SAMPLES = 20;                // 20 x 50 ms = 1 s
+const float    T_PLAN = 20.0f, T_LOW = 10.0f, T_SOON = 3.0f;      // minutes
+const float    F_HIGH_WARN = 1.3f, F_HIGH_CRIT = 1.7f, F_SLOW = 0.6f, F_BLOCK = 0.15f;
+// flow-deviation hold times (movement filter) are in holdFor() below
+const uint16_t DOWN_HOLD_MS = 1500;               // de-escalation delay (anti flicker)
+const uint16_t LONG_PRESS_MS = 1500, RESET_HOLD_MS = 2000;
+const uint16_t SCALES[3] = {1, 60, 240};          // simulated seconds per real second
+const uint8_t  BED_ANGLE[3] = {40, 90, 140};
+const uint8_t  IDLE_ANGLE = 0;
+const uint32_t ESC_MS = 20000;                    // unacknowledged CRIT -> escalate (production: 60000)
+const uint32_t SAVE_MS = 10000;                   // min time between EEPROM saves (production: 60000)
+const float    SAVE_DELTA = 2.0f;                 // save only if a bag changed by this many mL
+const uint8_t  SLOTS = 8;                         // rotating EEPROM slots (wear levelling)
+const uint8_t  MAGIC = 0xA9;
+const uint8_t  OCC_SAMPLES = 20;                  // 20 x 50 ms = 1 s bag present/absent debounce
+
+// bag-level alert: percentage comes from each bed's alert dial
+const uint8_t  ALERT_MIN_PCT = 2, ALERT_MAX_PCT = 50;
+const uint8_t  ALERT_PRE_PCT = 3;                 // pre-beep starts this many % above the level
+
+// ===================== TEXT =====================
+enum { S_OK = 0, S_EARLY, S_WARN, S_CRIT };
+enum { R_OK = 0, R_PLAN, R_LOW, R_SOON, R_EMPTY, R_BLOCK, R_HIGH, R_SLOW, R_FAULT, R_LEVEL };
+// event kind = reason - 1 for alerts, then:
+enum { EV_CLEAR = 9, EV_NEWBAG, EV_ACK, EV_RESET, EV_ESC, EV_RESTORE, EV_BAGON, EV_BAGOFF };
+
+const char* const RTXT[10] = {"OK  ", "PLAN", "LOW ", "SOON", "EMPT", "BLCK", "HIGH", "SLOW", "FALT", "LEVL"};
+const char* const KTEXT[17] = {"PLAN BAG", "LOW BAG ", "EMPTY<3M", "EMPTY   ", "BLOCKED ",
+                               "FLOW HI ", "FLOW LO ", "SENS FLT", "BAG LEVL", "CLEARED ",
+                               "STARTED ", "ACK     ", "RESET   ", "ESCALATE", "RESTORED",
+                               "BAG HUNG", "BAG OFF "};
+const char BLET[] = "123S";
+
+// ===================== DATA =====================
+struct Bed {
+  float    vol, flow, rx, tLeft;      // mL, mL/min, prescribed mL/min, minutes
+  int      raw;
+  uint8_t  faultCnt;
+  bool     fault, tKnown;
+  uint8_t  state, reason, ackState;
+  uint8_t  devLast, devEff;           // 0 none,1 block,2 high warn,3 high crit,4 slow
+  uint32_t devSince, lowerSince;
+  uint8_t  moves;                     // ignored patient movements
+  bool     pending;                   // deviation seen, not yet confirmed
+  bool     present;                   // an IV bag is hanging on this bed
+  bool     started;                   // monitoring is running on this bed
+  uint8_t  occCnt;                    // debounce counter for present/absent
+  bool     alertSet;                  // this bed's alert dial is turned up
+  uint8_t  alertPct;                  // this bed's alert percentage (2..50)
+  uint8_t  sizeIdx;                   // selected bag size (0=250, 1=500, 2=1000 mL)
+  uint8_t  bagIdx;                    // size of the bag that is hanging now
+};
+Bed B[3];
+
+float bagMl(uint8_t i) { return BAG_SIZES[B[i].bagIdx]; }
+
+struct Ev { uint32_t t; uint8_t bed, kind, val; };
+const uint8_t HIST_N = 8;
+Ev      evLog[HIST_N];
+uint8_t hHead = 0, hCount = 0;
+
+float   simSec = 0;                   // simulated seconds since 22:00
+uint8_t scaleIdx = 1;
+int8_t  topBed = -1;
+uint32_t critSince = 0;
+bool     escalated = false;
+uint32_t restoredUntil = 0;
+uint32_t tSave = 0;
+uint16_t saveSeq = 0;
+float    savedVol[3] = {0, 0, 0};
+
+uint32_t levelShowUntil = 0;          // LCD shows an alert level while its dial is moved
+uint8_t  levelShowBed = 0;
+uint32_t sizeShowUntil = 0;           // LCD shows the chosen bag size for a moment
+uint8_t  sizeShowBed = 0;
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+Servo servo;
+
+bool     bDown[3], bConsumed[3];
+bool     sDown[3];
+uint32_t sChange[3];
+uint32_t bTime[3], bChange[3];
+uint32_t allSince = 0;
+bool     resetDone = false;
+
+uint32_t tSample = 0, tDrain = 0, tEval = 0, tLcd = 0, tSerial = 0, tServo = 0, pageT = 0;
+uint8_t  page = 0;
+uint16_t curTone = 0;
+int      curAngle = IDLE_ANGLE;
+
+// ===================== HELPERS / LOG =====================
+void fmtClock(char* out, uint32_t t) {          // out >= 6 bytes
+  uint32_t tot = 22UL * 3600UL + t;
+  snprintf(out, 6, "%02u:%02u", (unsigned)((tot / 3600UL) % 24UL), (unsigned)((tot / 60UL) % 60UL));
+}
+
+void fmtTime(char* out, uint8_t i) {            // 3 chars + NUL
+  if (!B[i].tKnown) { strcpy(out, "---"); return; }
+  int m = (int)(B[i].tLeft + 0.5f);
+  if (m < 100) snprintf(out, 4, "%2dm", m);
+  else { int h = m / 60; if (h > 99) h = 99; snprintf(out, 4, "%2dh", h); }
+}
+
+void printEvent(uint8_t ix) {
+  char c[6]; fmtClock(c, evLog[ix].t);
+  Serial.print(c);
+  Serial.print(F("  Bed ")); Serial.print(BLET[evLog[ix].bed]);
+  Serial.print(F("  "));     Serial.print(KTEXT[evLog[ix].kind]);
+  if (evLog[ix].val != 255) { Serial.print(F("  ETA=")); Serial.print(evLog[ix].val); Serial.print(F("m")); }
+  Serial.println();
+}
+
+void logEvent(uint8_t bed, uint8_t kind, uint8_t val) {
+  evLog[hHead].t = (uint32_t)simSec;
+  evLog[hHead].bed = bed;
+  evLog[hHead].kind = kind;
+  evLog[hHead].val = val;
+  Serial.print(F("[EVENT] "));
+  printEvent(hHead);
+  hHead = (hHead + 1) % HIST_N;
+  if (hCount < HIST_N) hCount++;
+}
+
+void printHistory() {
+  Serial.println(F("---- EVENT HISTORY (newest first) ----"));
+  for (uint8_t r = 0; r < hCount; r++) printEvent((hHead + HIST_N - 1 - r) % HIST_N);
+  Serial.println(F("--------------------------------------"));
+}
+
+// ===================== POWER-CUT MEMORY (EEPROM) =====================
+struct Save {
+  uint8_t  magic;
+  uint16_t seq;
+  uint32_t simSec;
+  uint16_t vol10[3];      // mL x 10
+  uint8_t  rx10[3];       // mL/min x 10
+  uint8_t  present;       // bit i = bed i has a bag
+  uint8_t  started;       // bit i = bed i is being monitored
+  uint8_t  sel;           // 2 bits per bed: selected bag size
+  uint8_t  bag;           // 2 bits per bed: size of the hanging bag
+  uint8_t  crc;
+} __attribute__((packed));
+
+// takes plain bytes (not the struct) so the IDE's auto-generated prototype compiles
+uint8_t crcBytes(const uint8_t *p, uint8_t n) {
+  uint8_t c = 0x5A;
+  for (uint8_t i = 0; i < n; i++) c = (uint8_t)(((c << 1) | (c >> 7)) ^ p[i]);
+  return c;
+}
+
+void saveNow() {
+  Save s;
+  s.magic = MAGIC;
+  s.seq = ++saveSeq;
+  s.simSec = (uint32_t)simSec;
+  s.present = 0;
+  s.started = 0;
+  s.sel = 0;
+  s.bag = 0;
+  for (uint8_t i = 0; i < 3; i++) {
+    s.vol10[i] = (uint16_t)(B[i].vol * 10.0f);
+    s.rx10[i]  = (uint8_t)(B[i].rx * 10.0f + 0.5f);
+    if (B[i].present) s.present |= (1 << i);
+    if (B[i].started) s.started |= (1 << i);
+    s.sel |= (uint8_t)((B[i].sizeIdx & 3) << (2 * i));
+    s.bag |= (uint8_t)((B[i].bagIdx & 3) << (2 * i));
+    savedVol[i] = B[i].vol;
+  }
+  s.crc = crcBytes((const uint8_t*)&s, sizeof(Save) - 1);
+  EEPROM.put((int)((saveSeq % SLOTS) * sizeof(Save)), s);
+  tSave = millis();
+  Serial.println(F("[SAVE] state stored in EEPROM"));
+}
+
+bool loadSaved() {
+  Save best;
+  memset(&best, 0, sizeof best);
+  bool found = false;
+  for (uint8_t k = 0; k < SLOTS; k++) {
+    Save s;
+    EEPROM.get((int)(k * sizeof(Save)), s);
+    if (s.magic == MAGIC && s.crc == crcBytes((const uint8_t*)&s, sizeof(Save) - 1) && (!found || s.seq > best.seq)) { best = s; found = true; }
+  }
+  if (!found) return false;
+  saveSeq = best.seq;
+  simSec = (float)best.simSec;
+  for (uint8_t i = 0; i < 3; i++) {
+    B[i].vol = best.vol10[i] / 10.0f;
+    B[i].rx  = best.rx10[i] / 10.0f;
+    B[i].present = (best.present >> i) & 1;
+    B[i].started = (best.started >> i) & 1;
+    uint8_t si = (best.sel >> (2 * i)) & 3, bi = (best.bag >> (2 * i)) & 3;
+    B[i].sizeIdx = (si > 2) ? DEFAULT_SIZE_IDX : si;
+    B[i].bagIdx  = (bi > 2) ? DEFAULT_SIZE_IDX : bi;
+    savedVol[i] = B[i].vol;
+  }
+  return true;
+}
+
+void periodicSave(uint32_t now) {
+  if (now - tSave < SAVE_MS) return;
+  for (uint8_t i = 0; i < 3; i++) {
+    if (B[i].started && (B[i].vol - savedVol[i] >= SAVE_DELTA || savedVol[i] - B[i].vol >= SAVE_DELTA)) { saveNow(); return; }
+  }
+}
+
+// ===================== SENSING =====================
+void clearBedState(uint8_t i) {
+  Bed &b = B[i];
+  b.state = S_OK; b.reason = R_OK; b.ackState = S_OK;
+  b.lowerSince = 0; b.devEff = 0; b.devLast = 0; b.devSince = millis(); b.pending = false;
+  b.fault = false; b.faultCnt = 0;
+}
+
+void hangBag(uint8_t i) {                         // a bag appeared: wait for the START button
+  Bed &b = B[i];
+  b.present = true;
+  b.started = false;
+  b.bagIdx = b.sizeIdx;
+  b.vol = BAG_SIZES[b.bagIdx];
+  clearBedState(i);
+  logEvent(i, EV_BAGON, 255);
+  saveNow();
+}
+
+void removeBag(uint8_t i) {                       // the bag was taken away
+  Bed &b = B[i];
+  b.present = false;
+  b.started = false;
+  b.vol = 0; b.flow = 0;
+  clearBedState(i);
+  logEvent(i, EV_BAGOFF, 255);
+  saveNow();
+}
+
+// alert-percentage dials: fully left = not set, otherwise 2..50 %
+void sampleAlerts(bool first) {
+  for (uint8_t i = 0; i < 3; i++) {
+    Bed &b = B[i];
+    long sum = 0;
+    for (uint8_t k = 0; k < 4; k++) sum += analogRead(PIN_ALERT[i]);
+    int raw = (int)(sum / 4);
+    bool set = (raw >= RAW_MIN);
+    uint8_t pct = 0;
+    if (set) {
+      long p = (long)ALERT_MIN_PCT + (long)(raw - RAW_MIN) * (long)(ALERT_MAX_PCT - ALERT_MIN_PCT) / (long)(RAW_MAX - RAW_MIN);
+      if (p < (long)ALERT_MIN_PCT) p = ALERT_MIN_PCT;
+      if (p > (long)ALERT_MAX_PCT) p = ALERT_MAX_PCT;
+      pct = (uint8_t)p;
+    }
+    if (!first && set && (!b.alertSet || pct != b.alertPct)) { levelShowUntil = millis() + 2000; levelShowBed = i; }
+    b.alertSet = set;
+    b.alertPct = pct;
+  }
+}
+
+void sampleFlows(bool first) {
+  for (uint8_t i = 0; i < 3; i++) {
+    Bed &b = B[i];
+    long sum = 0;
+    for (uint8_t k = 0; k < 4; k++) sum += analogRead(PIN_FLOW[i]);
+    b.raw = sum / 4;
+
+    bool noBag = (b.raw < RAW_MIN);               // reading ~0 -> nothing hanging on this bed
+    bool bad   = (b.raw > RAW_MAX);               // saturated -> sensor fault
+    float fl = (float)(b.raw - RAW_MIN) * FLOW_MAX / (float)(RAW_MAX - RAW_MIN);
+    fl = constrain(fl, 0.0f, FLOW_MAX);
+
+    // ---- bag presence ----
+    if (first) {                                  // at start-up: follow the reading immediately
+      if (b.present && noBag) { b.present = false; b.started = false; b.vol = 0; b.flow = 0; }
+      else if (!b.present && !noBag) { b.present = true; b.started = false; b.bagIdx = b.sizeIdx; b.vol = BAG_SIZES[b.bagIdx]; }
+      b.occCnt = 0;
+    } else {                                      // normal operation: debounced (1 s)
+      bool change = (b.present && noBag) || (!b.present && !noBag);
+      if (change) {
+        if (++b.occCnt >= OCC_SAMPLES) {
+          b.occCnt = 0;
+          if (b.present) removeBag(i); else hangBag(i);
+        }
+      } else b.occCnt = 0;
+    }
+
+    if (!b.present) {
+      b.fault = false; b.faultCnt = 0; b.flow = 0;
+      continue;
+    }
+
+    // ---- sensor fault (only for started beds) ----
+    if (!b.started) {
+      b.fault = false; b.faultCnt = 0;
+    } else {
+      if (bad) { if (b.faultCnt < FAULT_SAMPLES) b.faultCnt++; }
+      else if (b.faultCnt > 0) b.faultCnt--;
+      if (!b.fault && b.faultCnt >= FAULT_SAMPLES) b.fault = true;
+      else if (b.fault && b.faultCnt == 0) { b.fault = false; b.flow = fl; }
+    }
+
+    if (!bad && !noBag && !b.fault) b.flow = first ? fl : (0.5f * b.flow + 0.5f * fl);   // else hold last valid flow
+  }
+}
+
+// simulated bag draining (only started beds)
+void drain(uint32_t dtMs) {
+  float sc = (float)SCALES[scaleIdx];
+  simSec += (float)dtMs / 1000.0f * sc;
+  float dtMin = (float)dtMs / 60000.0f * sc;
+  for (uint8_t i = 0; i < 3; i++) {
+    if (B[i].present && B[i].started && B[i].vol > 0) {
+      B[i].vol -= B[i].flow * dtMin;
+      if (B[i].vol < 0) B[i].vol = 0;
+    }
+  }
+}
+
+// ===================== ALERT + PRIORITY ENGINE =====================
+// how long a deviation must persist before it counts (movement filter)
+uint32_t holdFor(uint8_t d) {
+  switch (d) {
+    case 0:  return 1000;    // back to normal
+    case 1:  return 3000;    // blocked
+    case 3:  return 2500;    // flow far too high
+    default: return 4000;    // moderately high / slow
+  }
+}
+
+void consider(uint8_t &cand, uint8_t &why, uint8_t s, uint8_t r) {
+  if (s > cand) { cand = s; why = r; }
+}
+
+void evaluate(uint32_t now) {
+  for (uint8_t i = 0; i < 3; i++) {
+    Bed &b = B[i];
+
+    if (!b.present || !b.started) {                // empty or not started: no alarms, not ranked
+      b.state = S_OK; b.reason = R_OK; b.ackState = S_OK;
+      b.tKnown = false; b.pending = false; b.devEff = 0; b.devLast = 0; b.lowerSince = 0;
+      continue;
+    }
+
+    // --- prediction ---
+    if (b.vol <= 0) { b.tLeft = 0; b.tKnown = true; }
+    else if (b.flow >= 0.3f) { b.tLeft = b.vol / b.flow; b.tKnown = true; }
+    else b.tKnown = false;
+
+    // --- flow deviation versus prescription (must persist) ---
+    uint8_t d = 0;
+    if (b.vol > 0 && b.faultCnt == 0) {
+      float r = b.flow / b.rx;
+      if (r < F_BLOCK) d = 1;
+      else if (r > F_HIGH_CRIT) d = 3;
+      else if (r > F_HIGH_WARN) d = 2;
+      else if (r < F_SLOW) d = 4;
+    }
+    if (d != b.devLast) {
+      if (d == 0 && b.devLast != 0 && b.devEff != b.devLast) {   // ended before it was confirmed
+        b.moves++;
+        Serial.print(F("[FILTER] Bed ")); Serial.print(i + 1);
+        Serial.println(F(": short flow change ignored (patient movement)"));
+      }
+      b.devLast = d; b.devSince = now;
+    }
+    b.pending = (d != 0 && b.devEff != d);
+    if (now - b.devSince >= holdFor(d)) b.devEff = d;
+
+    // --- candidate state ---
+    uint8_t cand = S_OK, why = R_OK;
+    if (b.vol <= 0) consider(cand, why, S_CRIT, R_EMPTY);
+    else {
+      // bag-level alert from this bed's alert dial: pre-beep (WARN) from level+3 %, siren (CRIT) at the level
+      if (b.alertSet) {
+        float pctNow = b.vol * 100.0f / bagMl(i);
+        if (pctNow <= (float)b.alertPct)                         consider(cand, why, S_CRIT, R_LEVEL);
+        else if (pctNow <= (float)(b.alertPct + ALERT_PRE_PCT))  consider(cand, why, S_WARN, R_LEVEL);
+      }
+      if (b.tKnown) {
+        if (b.tLeft <= T_SOON)      consider(cand, why, S_CRIT, R_SOON);
+        else if (b.tLeft <= T_LOW)  consider(cand, why, S_WARN, R_LOW);
+        else if (b.tLeft <= T_PLAN) consider(cand, why, S_EARLY, R_PLAN);
+      }
+    }
+    if (b.fault) consider(cand, why, S_WARN, R_FAULT);
+    switch (b.devEff) {
+      case 1: consider(cand, why, S_CRIT, R_BLOCK); break;
+      case 3: consider(cand, why, S_CRIT, R_HIGH);  break;
+      case 2: consider(cand, why, S_WARN, R_HIGH);  break;
+      case 4: consider(cand, why, S_WARN, R_SLOW);  break;
+    }
+
+    // --- escalate immediately, de-escalate after a delay ---
+    uint8_t oldS = b.state, oldR = b.reason;
+    if (cand >= oldS) {
+      b.state = cand; b.reason = why; b.lowerSince = 0;
+    } else {
+      if (b.lowerSince == 0) b.lowerSince = now;
+      if (now - b.lowerSince >= DOWN_HOLD_MS) { b.state = cand; b.reason = why; b.lowerSince = 0; }
+    }
+
+    uint8_t eta = b.tKnown ? (uint8_t)min(250, (int)(b.tLeft + 0.5f)) : 255;
+    if (b.state > oldS) logEvent(i, b.reason - 1, eta);
+    else if (b.state == S_OK && oldS > S_OK) logEvent(i, EV_CLEAR, 255);
+    else if (b.state == oldS && b.state >= S_WARN && b.reason != oldR && b.reason != R_OK)
+      logEvent(i, b.reason - 1, eta);
+
+    if (b.state < b.ackState) b.ackState = b.state;     // re-arm after de-escalation
+  }
+
+  // priority: highest state, then most urgent (smallest time left)
+  topBed = -1;
+  long best = -1;
+  for (uint8_t i = 0; i < 3; i++) {
+    if (B[i].state >= S_EARLY) {
+      long urg;
+      if (B[i].reason == R_EMPTY) urg = 5000;
+      else if (B[i].reason == R_BLOCK) urg = 4500;
+      else if (B[i].tKnown) urg = 4000 - constrain((long)(B[i].tLeft * 10.0f), 0L, 4000L);
+      else urg = 2000;
+      long k = (long)B[i].state * 10000L + urg;
+      if (k > best) { best = k; topBed = i; }
+    }
+  }
+}
+
+// ===================== OPERATOR ACTIONS =====================
+// START (or NEW BAG): full bag, current flow becomes the prescribed rate, monitoring on
+void startBed(uint8_t i) {
+  Bed &b = B[i];
+  b.bagIdx = b.sizeIdx;                            // apply the selected bag size
+  b.vol = BAG_SIZES[b.bagIdx];
+  b.rx = constrain(b.flow, 1.0f, FLOW_MAX);
+  b.started = true;
+  clearBedState(i);
+  logEvent(i, EV_NEWBAG, 255);
+  saveNow();
+}
+
+void ackAll() {
+  bool any = false;
+  for (uint8_t i = 0; i < 3; i++) {
+    if (B[i].state > B[i].ackState) any = true;
+    B[i].ackState = B[i].state;
+  }
+  if (any) logEvent(3, EV_ACK, 255);
+}
+
+void doReset() {
+  for (uint8_t i = 0; i < 3; i++) {
+    B[i].started = false;
+    B[i].moves = 0;
+    B[i].bagIdx = B[i].sizeIdx;
+    B[i].vol = B[i].present ? bagMl(i) : 0.0f;
+    clearBedState(i);
+  }
+  hHead = 0; hCount = 0;
+  logEvent(3, EV_RESET, 255);
+  saveNow();
+}
+
+void handleButtons(uint32_t now) {
+  uint8_t nDown = 0;
+  for (uint8_t i = 0; i < 3; i++) {
+    bool pressed = (digitalRead(PIN_BTN[i]) == LOW);
+    if (pressed != bDown[i] && now - bChange[i] >= 30) {
+      bChange[i] = now;
+      bDown[i] = pressed;
+      if (pressed) { bTime[i] = now; bConsumed[i] = false; }
+      else if (!bConsumed[i]) {                          // short press = START
+        if (!B[i].present) Serial.println(F("[INFO] that bed has no IV bag - turn its flow dial up"));
+        else if (!B[i].alertSet) Serial.println(F("[INFO] set that bed's ALERT % dial first"));
+        else startBed(i);
+      }
+    }
+    if (bDown[i]) nDown++;
+  }
+  if (nDown >= 2)
+    for (uint8_t i = 0; i < 3; i++) if (bDown[i]) bConsumed[i] = true;
+
+  for (uint8_t i = 0; i < 3; i++) {
+    if (bDown[i] && !bConsumed[i] && now - bTime[i] >= LONG_PRESS_MS) {
+      bConsumed[i] = true;
+      ackAll();                                           // long press
+    }
+  }
+
+  if (nDown == 3) {
+    if (allSince == 0) allSince = now;
+    if (!resetDone && now - allSince >= RESET_HOLD_MS) { doReset(); resetDone = true; }
+  } else {
+    allSince = 0; resetDone = false;
+  }
+}
+
+void handleSizeButtons(uint32_t now) {
+  for (uint8_t i = 0; i < 3; i++) {
+    bool pressed = (digitalRead(PIN_SIZE[i]) == LOW);
+    if (pressed != sDown[i] && now - sChange[i] >= 30) {
+      sChange[i] = now;
+      sDown[i] = pressed;
+      if (!pressed) continue;
+      Bed &b = B[i];
+      if (!b.present) { Serial.println(F("[INFO] that bed has no IV bag - turn its flow dial up")); continue; }
+      b.sizeIdx = (b.sizeIdx + 1) % 3;
+      if (!b.started) { b.bagIdx = b.sizeIdx; b.vol = BAG_SIZES[b.bagIdx]; }   // not started: applies now
+      sizeShowUntil = now + 2000;
+      sizeShowBed = i;
+      saveNow();
+      Serial.print(F("Bed ")); Serial.print(i + 1);
+      Serial.print(b.started ? F(" next bag = ") : F(" bag = "));
+      Serial.print((int)BAG_SIZES[b.sizeIdx]); Serial.println(F(" mL"));
+    }
+  }
+}
+
+void handleSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'h') printHistory();
+    else if (c == 'a') ackAll();
+    else if (c == 'r') doReset();
+    else if (c == 't') {
+      scaleIdx = (scaleIdx + 1) % 3;
+      Serial.print(F("Time speed x")); Serial.println(SCALES[scaleIdx]);
+    }
+    else if (c == 'd') {
+      for (uint8_t i = 0; i < 3; i++) if (B[i].present && B[i].started) B[i].vol = bagMl(i);
+      saveNow();
+      Serial.println(F("Demo volumes loaded"));
+    }
+    else if (c == 'p') {
+      Serial.println(F("POWER CUT NOW - restarting, last EEPROM save will be restored"));
+      Serial.flush();
+      wdt_enable(WDTO_15MS);
+      while (1) { }
+    }
+    else if (c == '?') Serial.println(F("h=history a=ack r=reset t=time speed d=demo volumes p=power cut"));
+  }
+}
+
+// ===================== ALARM ESCALATION =====================
+void updateEscalation(uint32_t now) {
+  bool un = false;
+  for (uint8_t i = 0; i < 3; i++)
+    if (B[i].state == S_CRIT && B[i].ackState < S_CRIT) un = true;
+
+  if (un) {
+    if (critSince == 0) critSince = now;
+    if (!escalated && now - critSince >= ESC_MS) {
+      escalated = true;
+      logEvent(topBed >= 0 ? topBed : 3, EV_ESC, 255);
+    }
+  } else {
+    critSince = 0;
+    escalated = false;
+  }
+}
+
+// ===================== OUTPUTS =====================
+void setTone(uint16_t f) {
+  if (f == curTone) return;
+  curTone = f;
+  if (f) tone(PIN_BUZZER, f); else noTone(PIN_BUZZER);
+}
+
+void updateBuzzer(uint32_t now) {
+  bool critUn = false, warnUn = false, faultUn = false, earlyUn = false;
+  for (uint8_t i = 0; i < 3; i++) {
+    if (B[i].ackState >= B[i].state) continue;
+    if (B[i].state == S_CRIT) critUn = true;
+    else if (B[i].state == S_WARN) { if (B[i].reason == R_FAULT) faultUn = true; else warnUn = true; }
+    else if (B[i].state == S_EARLY) earlyUn = true;
+  }
+  if (critUn) {
+    if (escalated) setTone(((now / 100) & 1) ? 3000 : 2000);        // escalated: faster, higher siren
+    else           setTone(((now / 250) & 1) ? 2200 : 1500);        // siren
+  } else if (warnUn) {
+    setTone((now % 1000) < 300 ? 1000 : 0);                         // 1 beep / s
+  } else if (faultUn) {
+    uint16_t ph = now % 3000;                                       // low double beep
+    setTone((ph < 150 || (ph >= 300 && ph < 450)) ? 400 : 0);
+  } else if (earlyUn) {
+    setTone((now % 4000) < 100 ? 1800 : 0);                         // chirp
+  } else {
+    setTone(0);
+  }
+}
+
+// OK green | WAIT green slow blink | PLAN green+red | WARN red 2Hz | CRIT red strobe | fault alternating
+void updateLeds(uint32_t now) {
+  for (uint8_t i = 0; i < 3; i++) {
+    bool g = false, r = false;
+    if (!B[i].present) { /* empty bed: LEDs off */ }
+    else if (!B[i].started)         { g = (now / 500) & 1; }
+    else if (B[i].reason == R_FAULT && B[i].state > S_OK) { g = (now / 500) & 1; r = !g; }
+    else if (B[i].state == S_OK)    { g = true; }
+    else if (B[i].state == S_EARLY) { g = true; r = true; }
+    else if (B[i].state == S_WARN)  { r = (now / 250) & 1; }
+    else                            { r = (now / (escalated ? 30 : 60)) & 1; }
+    digitalWrite(PIN_LED_G[i], g);
+    digitalWrite(PIN_LED_R[i], r);
+  }
+}
+
+void updateServo(uint32_t now) {
+  int target = (topBed >= 0 && B[topBed].state >= S_WARN) ? BED_ANGLE[topBed] : IDLE_ANGLE;
+  if (curAngle != target && now - tServo >= 12) {
+    tServo = now;
+    curAngle += (target > curAngle) ? 1 : -1;
+    servo.write(curAngle);
+  }
+}
+
+// ===================== LCD =====================
+void lcdLine(uint8_t row, const char* s) {
+  char b[21];
+  uint8_t n = 0;
+  while (s[n] && n < 20) { b[n] = s[n]; n++; }
+  while (n < 20) b[n++] = ' ';
+  b[20] = 0;
+  lcd.setCursor(0, row);
+  lcd.print(b);
+}
+
+void drawDashboard(uint32_t now) {
+  char b[28], tm[4], fs[6];
+
+  uint8_t nPresent = 0, nStarted = 0;
+  bool needAlert = false;                                 // a bag is hung but its alert dial is not set
+  for (uint8_t i = 0; i < 3; i++) {
+    if (B[i].present) nPresent++;
+    if (B[i].present && B[i].started) nStarted++;
+    if (B[i].present && !B[i].started && !B[i].alertSet) needAlert = true;
+  }
+
+  if ((int32_t)(sizeShowUntil - now) > 0) {
+    if (B[sizeShowBed].started) snprintf(b, sizeof b, "B%d NEXT BAG %4dmL", sizeShowBed + 1, (int)BAG_SIZES[B[sizeShowBed].sizeIdx]);
+    else                        snprintf(b, sizeof b, "BED %d BAG %4dmL", sizeShowBed + 1, (int)BAG_SIZES[B[sizeShowBed].sizeIdx]);
+  } else if ((int32_t)(levelShowUntil - now) > 0) {
+    snprintf(b, sizeof b, "ALERT B%d AT %2d%% (+%d)", levelShowBed + 1, B[levelShowBed].alertPct, ALERT_PRE_PCT);
+  } else if (needAlert) {
+    strcpy(b, "SET ALERT % DIALS");
+  } else if ((int32_t)(restoredUntil - now) > 0) {
+    strcpy(b, "POWER RESTORED-CHECK");
+  } else if (topBed >= 0) {
+    Bed &t = B[topBed];
+    bool acked = t.ackState >= t.state;
+    fmtTime(tm, topBed);
+    if (t.state == S_CRIT && !acked && ((now / 600) & 1)) {
+      if (escalated) snprintf(b, sizeof b, "ESCALATED! NO ACK B%d", topBed + 1);
+      else           snprintf(b, sizeof b, "!! CALL BED %d NOW", topBed + 1);
+    } else
+      snprintf(b, sizeof b, "NXT:B%d %s %s %s", topBed + 1, RTXT[t.reason], tm, acked ? "ACK" : "");
+  } else if (nPresent == 0) {
+    strcpy(b, "NO IV BAGS HUNG");
+  } else if (nStarted < nPresent) {
+    strcpy(b, "PRESS BTN TO START");
+  } else {
+    snprintf(b, sizeof b, "ALL OK %d/3 IV  x%d", nStarted, SCALES[scaleIdx]);
+  }
+  lcdLine(0, b);
+
+  for (uint8_t i = 0; i < 3; i++) {
+    if (!B[i].present) {
+      snprintf(b, sizeof b, "%d:  -- NO IV BAG --", i + 1);
+      lcdLine(1 + i, b);
+      continue;
+    }
+    if (B[i].fault) strcpy(fs, " ERR");
+    else { int f10 = (int)(B[i].flow * 10.0f + 0.5f); snprintf(fs, sizeof fs, "%2d.%d", f10 / 10, f10 % 10); }
+
+    if (!B[i].started) {                                  // bag hung, waiting for START
+      if (B[i].alertSet) snprintf(b, sizeof b, "%d:%s %4dmL A%2d%%", i + 1, fs, (int)BAG_SIZES[B[i].sizeIdx], B[i].alertPct);
+      else               snprintf(b, sizeof b, "%d:%s %4dmL SET A%%", i + 1, fs, (int)BAG_SIZES[B[i].sizeIdx]);
+      lcdLine(1 + i, b);
+      continue;
+    }
+
+    int pct = (int)(B[i].vol * 100.0f / bagMl(i) + 0.5f);
+    fmtTime(tm, i);
+    const char* rt = (B[i].state == S_OK && B[i].pending) ? "MOV?" : RTXT[B[i].reason];
+    snprintf(b, sizeof b, "%d%c%3d%% %s %s %s", i + 1, (i == topBed) ? '>' : ':', pct, fs, tm, rt);
+    lcdLine(1 + i, b);
+  }
+}
+
+void drawLog() {
+  char b[28], c[6], v[4];
+  snprintf(b, sizeof b, "EVENT LOG (%d/%d) x%d", hCount, HIST_N, SCALES[scaleIdx]);
+  lcdLine(0, b);
+  for (uint8_t r = 0; r < 3; r++) {
+    if (r < hCount) {
+      uint8_t ix = (hHead + HIST_N - 1 - r) % HIST_N;
+      fmtClock(c, evLog[ix].t);
+      if (evLog[ix].val != 255) snprintf(v, sizeof v, "%3d", evLog[ix].val); else strcpy(v, "   ");
+      snprintf(b, sizeof b, "%s %c %s%s", c, BLET[evLog[ix].bed], KTEXT[evLog[ix].kind], v);
+      lcdLine(1 + r, b);
+    } else {
+      lcdLine(1 + r, "");
+    }
+  }
+}
+
+void updateLcd(uint32_t now) {
+  bool lock = ((int32_t)(levelShowUntil - now) > 0) || ((int32_t)(sizeShowUntil - now) > 0);
+  for (uint8_t i = 0; i < 3; i++) {
+    if (B[i].state == S_CRIT && B[i].ackState < S_CRIT) lock = true;
+    if (B[i].present && !B[i].started) lock = true;       // beds waiting for START stay on the dashboard
+  }
+
+  if (lock) { page = 0; pageT = now; }
+  else if (now - pageT > (page == 0 ? 7000UL : 3500UL)) { page ^= 1; pageT = now; }
+
+  if (page == 0) drawDashboard(now); else drawLog();
+}
+
+// ===================== SERIAL DASHBOARD =====================
+void printStatus() {
+  char c[6]; fmtClock(c, (uint32_t)simSec);
+  Serial.print(c); Serial.print(F(" x")); Serial.print(SCALES[scaleIdx]); Serial.print(F(" | "));
+  for (uint8_t i = 0; i < 3; i++) {
+    Serial.print('B'); Serial.print(i + 1); Serial.print(' ');
+    if (!B[i].present) { Serial.print(F("NO IV BAG | ")); continue; }
+    Serial.print(F("ALM="));
+    if (B[i].alertSet) { Serial.print(B[i].alertPct); Serial.print(F("% ")); } else Serial.print(F("not set "));
+    if (!B[i].started) {
+      Serial.print(F("WAIT ")); Serial.print((int)BAG_SIZES[B[i].sizeIdx]); Serial.print(F("mL flow ")); Serial.print(B[i].flow, 1); Serial.print(F(" - press button | "));
+      continue;
+    }
+    Serial.print((int)(B[i].vol)); Serial.print('/'); Serial.print((int)bagMl(i)); Serial.print(F("mL "));
+    if (B[i].fault) Serial.print(F("ERR"));
+    else Serial.print(B[i].flow, 1);
+    Serial.print(F("/min(Rx ")); Serial.print(B[i].rx, 1); Serial.print(F(") ETA="));
+    if (B[i].tKnown) { Serial.print((int)(B[i].tLeft + 0.5f)); Serial.print('m'); } else Serial.print(F("--"));
+    Serial.print(' '); Serial.print(RTXT[B[i].reason]);
+    Serial.print(F(" mv=")); Serial.print(B[i].moves);
+    Serial.print(F(" | "));
+  }
+  Serial.print(F("NEXT="));
+  if (topBed >= 0) { Serial.print('B'); Serial.println(topBed + 1); } else Serial.println(F("none"));
+}
+
+// ===================== SETUP / LOOP =====================
+void setup() {
+  Serial.begin(115200);
+  for (uint8_t i = 0; i < 3; i++) {
+    pinMode(PIN_BTN[i], INPUT_PULLUP);
+    pinMode(PIN_SIZE[i], INPUT_PULLUP);
+    pinMode(PIN_LED_G[i], OUTPUT);
+    pinMode(PIN_LED_R[i], OUTPUT);
+  }
+  pinMode(PIN_BUZZER, OUTPUT);
+
+  lcd.init();
+  lcd.backlight();
+  lcdLine(0, "  SMART IV DRIP");
+  lcdLine(1, "  MONITOR");
+  lcdLine(2, "Nurse priority system");
+  lcdLine(3, "   self-test...");
+
+  for (uint8_t i = 0; i < 3; i++) {
+    digitalWrite(PIN_LED_G[i], HIGH); digitalWrite(PIN_LED_R[i], HIGH);
+    delay(200);
+  }
+  tone(PIN_BUZZER, 1200, 150);
+  delay(300);
+  for (uint8_t i = 0; i < 3; i++) { digitalWrite(PIN_LED_G[i], LOW); digitalWrite(PIN_LED_R[i], LOW); }
+
+  servo.attach(PIN_SERVO);
+  servo.write(IDLE_ANGLE);
+  for (int a = IDLE_ANGLE; a <= 140; a += 2) { servo.write(a); delay(8); }
+  for (int a = 140; a >= IDLE_ANGLE; a -= 2) { servo.write(a); delay(8); }
+  curAngle = IDLE_ANGLE;
+
+  for (uint8_t i = 0; i < 3; i++) { B[i].sizeIdx = DEFAULT_SIZE_IDX; B[i].bagIdx = DEFAULT_SIZE_IDX; B[i].vol = BAG_SIZES[DEFAULT_SIZE_IDX]; B[i].rx = 6.0f; B[i].present = true; B[i].started = false; }
+  bool restored = loadSaved();
+  if (restored) restoredUntil = millis() + 5000;
+  sampleAlerts(true);
+  sampleFlows(true);
+  evaluate(millis());
+
+  if (restored) {
+    logEvent(3, EV_RESTORE, 255);
+    Serial.println(F("POWER RESTORED: bag volumes and prescriptions loaded from EEPROM. '?' for commands."));
+  } else {
+    Serial.println(F("Smart IV Drip Monitor ready. Per bed: set ALERT % dial, set FLOW dial, press the bed button. '?' for commands."));
+  }
+  pageT = millis();
+}
+
+void loop() {
+  uint32_t now = millis();
+
+  handleButtons(now);
+  handleSizeButtons(now);
+  handleSerial();
+
+  if (now - tSample >= 50)  { tSample = now; sampleAlerts(false); sampleFlows(false); }
+  if (now - tDrain >= 100)  { drain(now - tDrain); tDrain = now; }
+  if (now - tEval >= 250)   { tEval = now; evaluate(now); }
+
+  updateEscalation(now);
+  periodicSave(now);
+
+  updateLeds(now);
+  updateBuzzer(now);
+  updateServo(now);
+
+  if (now - tLcd >= 250)     { tLcd = now; updateLcd(now); }
+  if (now - tSerial >= 2000) { tSerial = now; printStatus(); }
+}
